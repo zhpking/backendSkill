@@ -11,4 +11,4 @@
 ## 目录
 [redis](https://github.com/zhpking/backendSkill/blob/main/redis/redis.md "redis")
 
-[mysql](https://github.com/zhpking/backendSkill/blob/main/redis/mysql.md "mysql")
+[mysql](https://github.com/zhpking/backendSkill/blob/main/mysql/mysql.md "mysql")
