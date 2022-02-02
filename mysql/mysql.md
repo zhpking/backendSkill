@@ -106,9 +106,94 @@ change buffer 是用来优化二级且非唯一索引，且对应的数据页没
 
 	因为每次唯一索引数据更新或者插入的时候，都需要判断数据的唯一性，不存在这个数据才能更新或者插入，在校验唯一性的过程中，不管怎样都需要把对应的数据页加载到内存中，既然数据页已经在内存中了，那么直接改就行了。
 
-##### redo log
+##### redo log和binlog
+redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb特有的，用来实现crash-safe，而binlog是server层特有的日志，所以无论哪个存储引擎都能够使用。
+
+###### redo log
+如果数据每次在每次更新或者插入的时候，都直接写磁盘持久化的话，那么这样会带来io的性能损耗，为了优化这点，innodb使用了一种WAL技术（Write-Ahead Logging），也就是在数据落盘之前，innodb会先写日志，再写磁盘。
+
+具体来说，就是更新和插入的数据，innodb只要把buffer pool的数据更新了，写完了redo log，就认为数据的更新已经完成了（当然还要写bin log，但是这是server层做的事）。同时，innodb一般会在系统比较空闲的时候，再把redo log的操作记录批量更新到磁盘里，这样做的好处就是减少了io，把随机写改成了顺序写。
+
+除此之外，redo log还能保证数据库发生异常重启，之前提交的记录都不会丢失，因为只要写到redo log后，发生了异常重启只要把重新把磁盘中redo log的数据重新加载回内存即可（crash-safe）。
+
+当然，redo log的内存不是无限大的，而是固定大小（参数innodb_log_file_size【每个redo log文件大小】 innodb_mirrored_log_groups【有多少个redo log文件，但5.7该参数就被废弃了】），而且是个环状结构，其结构如下图所示：
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220202230337968-1594751133.png)
+
+- write pos：当前记录写到的位置
+- check point：开始回收内存的位置
+
+所以write pos和check point就是redo log内存所剩空间，如果write pos追上了check point，那么innodb就无法继续执行数据更新，只能先把redo log中的数据持久化落盘，回收内存，推进check point位置空出剩余内存后，才能继续执行更新操作。
+
+###### binlog
+用于记录mysql执行插入和更新操作的相关语句，用于数据备份和主从复制。
+
+###### redo log和binlog的不同点
+- redo log 是 InnoDB 引擎特有的；binlog 是 MySQL 的 Server 层实现的，所有引擎都可以使用。
+
+- redo log 是物理日志，记录的是“在某个数据页上做了什么修改”；binlog 是逻辑日志，记录的是这个语句的原始逻辑，比如“给 ID=2 这一行的 c 字段加 1 ”。
+
+- redo log 是循环写的，空间固定会用完；binlog 是可以追加写入的。“追加写”是指 binlog 文件写到一定大小后会切换到下一个，并不会覆盖以前的日志。
+
+###### 二阶段提交
+9~13的执行过程，其实就是二阶段提交，其过程细化后，如下图所示：
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220202233717482-1824718105.png)
+
+1. 执行器先找引擎取 ID=2 这一行。ID 是主键，引擎直接用树搜索找到这一行。如果 ID=2 这一行所在的数据页本来就在内存中，就直接返回给执行器；否则，需要先从磁盘读入内存，然后再返回。
+
+2. 执行器拿到引擎给的行数据，把这个值加上 1，比如原来是 N，现在就是 N+1，得到新的一行数据，再调用引擎接口写入这行新数据。
+
+3. 引擎将这行新数据更新到内存中，同时将这个更新操作记录到 redo log 里面，此时 redo log 处于 prepare 状态。然后告知执行器执行完成了，随时可以提交事务。
+
+4. 执行器生成这个操作的 binlog，并把 binlog 写入磁盘。
+
+5. 执行器调用引擎的提交事务接口，引擎把刚刚写入的 redo log 改成提交（commit）状态，更新完成。
+
+其中，如果在执行的过程中，服务器down掉了，那个分为3种情况进行分析：
+
+- 如果redo log处在prepare阶段，但还没写binlog，那么恢复之后就会执行数据的回滚操作
+
+- 如果redo log处在prepare阶段，已经写了binlog，那么恢复之后只要在binlog找到记录，就会把redo log改为commit状态
+
+- 如果redo log处在commit状态， 那么说明binlog肯定有对应的数据，那么直接提交事务即可
+
+为什么要搞这么复杂，其实就是为了保证redo log和binlog数据的一致性。
+
+试想下，如果binlog和redo log数据不一致的话，那么数据一致性肯定会遭到破坏，比如：
+- binlog 多了一条update id = 2的操作，而redo log没有，那么从库的数据肯定和主库不一直，而且用binlog在恢复数据的时候，也会莫名其妙多了一条update id = 2
+
+- 反之，redo log有而binlog没有，那么从库肯定会丢了这条数据，而恢复数据的时候，也会丢掉这条数据
+
+###### 双1参数介绍
+双1参数指的是innodb_flush_log_at_trx_commit和sync_binlog，分别表示每次事务的redo log和binlog持久化到磁盘的策略
+
+- innodb_flush_log_at_trx_commit
+
+	- 0
+		每次事务提交时都只是把redo log留在redo log buffer中
+	
+	- 1
+		每次事务提交时都将redo log直接持久化到磁盘
+	
+	- 2
+		每次事务提交时都只是把redo log写到page cache（innodb有一个后台线程，会每秒调用write把redo log buffer写到page cache，再调用fsync持久化到磁盘）
+
+- sync_binlog
+
+	- 0
+		每次提交事务都只write，不fsync
+	
+	- 1
+		每次提交事务都会执行fsync
+	
+	- N（N>1）
+		每次提交事务都write，但累积N个事务后才fsync
 
 ##### double write
+提供可靠性（就是从page cache中持久化到磁盘过程提供可靠性，因为mysql页是16k，而操作系统磁盘写入最小单位是4k，所以刷盘的时候只能4k4k地写）
+
+innoDB存储引擎正在写入某个页到表中，突然发生了宕机（比如16KB的页，只写了4KB），通过重做日志中的记录进行恢复的时候（重新执行），因为页已经发生了损坏（写了4KB的数据），再重新对该页操作是没意义的
+
+所以引入了双写，在对缓冲池的脏页进行刷新时，先记录原先该页的数据，当写入失效发生的时候，先恢复该页原来的数据，在重新通过重做日志重新执行一次操作
 
 
 
