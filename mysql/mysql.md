@@ -106,6 +106,21 @@ change buffer 是用来优化二级且非唯一索引，且对应的数据页没
 
 	因为每次唯一索引数据更新或者插入的时候，都需要判断数据的唯一性，不存在这个数据才能更新或者插入，在校验唯一性的过程中，不管怎样都需要把对应的数据页加载到内存中，既然数据页已经在内存中了，那么直接改就行了。
 
+如果数据库down掉的话，change buffer丢失，会导致数据丢失吗？
+
+不会，因为语句写入change buffer后，接下来的流程（图中第9,10步）会写入bin log和redo log，而且事务提交，bin log和redo log写成功后，事务才会执行成功，所以就算change buffer丢了，在恢复数据的时候，redo log也是已经是更新完的数据。
+
+###### 触发merge操作时机
+- 访问对应的数据页
+
+- 后台线程定期merge
+
+- 数据库正常关闭（shutdown）
+
+###### change buffer大小设置
+innodb_change_buffer_max_size参数，设置为50就是change buffer的大小最多只能占用buffer pool的50%
+
+
 ##### redo log和binlog
 redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb特有的，用来实现crash-safe，而binlog是server层特有的日志，所以无论哪个存储引擎都能够使用。
 
@@ -133,6 +148,55 @@ redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb
 - redo log 是物理日志，记录的是“在某个数据页上做了什么修改”；binlog 是逻辑日志，记录的是这个语句的原始逻辑，比如“给 ID=2 这一行的 c 字段加 1 ”。
 
 - redo log 是循环写的，空间固定会用完；binlog 是可以追加写入的。“追加写”是指 binlog 文件写到一定大小后会切换到下一个，并不会覆盖以前的日志。
+
+##### flush操作
+就是把脏页数据，落盘到磁盘上
+
+###### 脏页
+内存数据页跟磁盘数据页内容不一致，这个内存页就叫脏页
+
+###### 触发flush操作的时机
+- redo log写满
+
+- 系统内存不足，需要淘汰一些内存页，而这些内存页恰巧包含了脏页
+
+- 在mysql任务系统空闲的时候
+
+- mysql正常关闭的时候
+
+其中，要注意的事第1,2中情况
+
+第一种情况，因为redo log满了的话系统是不再接受更新操作，相当于mysql写入挂掉了
+
+第二种情况，内存淘汰其实是InnoDB的常态操作，InnoDB 用缓冲池（buffer pool）管理内存，缓冲池中的内存页有三种状态：
+
+- 还没有使用的
+
+- 使用了并且是干净页
+
+- 使用了并且是脏页
+
+因为InnoDB的策略是尽量使用内存，因此对于一个长时间运行的库来说，未被使用的页面很少
+
+而1,2种情况，都是有脏页导致的（第一种情况是脏页越多，redo log占用就越大），所以，只要降低了脏页的比例，那么就能尽可能的避免上面这两种情况了
+
+###### 刷脏页的控制策略
+innodb_io_capacity变量定义了InnoDB后台任务每秒可用的I/O操作数(IOPS)，这个参数控制了innodb每秒刷脏页的速率，所以一般这个值设置成磁盘的IOPS
+
+磁盘的 IOPS 可以通过 fio 这个工具来测试，下面的语句是我用来测试磁盘随机读写的命令：
+
+```fio -filename=$filename -direct=1 -iodepth 1 -thread -rw=randrw -ioengine=psync -bs=16k -size=500M -numjobs=10 -runtime=10 -group_reporting -name=mytest 
+```
+
+
+
+nnodb_io_capacity 定义了后台任务可用的 IOPS 量
+
+innodb_io_capacity_max 定义了后台任务可用的最大 IOPS 量
+
+
+
+
 
 ###### 二阶段提交
 9~13的执行过程，其实就是二阶段提交，其过程细化后，如下图所示：
@@ -527,6 +591,63 @@ T表有个索引abc，而最左前缀的意思就是先比较a的大小，再比
 ![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220204165114024-1357325003.png)
 
 虽然结果都只有一条记录符合，不过5.6之前，要回表3次，而5.6之后，只需要回表一次。
+
+#### 强制走索引
+```force index(索引名) // 强制走索引```
+```select * from t force index(a) where a between 10000 and 20000  //强制走a索引```
+
+#### 前缀索引
+某些字段因为是varchar类型，而且需要在为其建立索引，为了节省索引的空间，一般会使用前缀索引。
+
+##### 如何创建前缀索引
+格式 ： ```alter table xxx add index 索引名(字段名(6))```，如：
+
+```alter table SUser add index index2(email(6))```
+
+##### 前缀索引的优缺点
+- 优点
+
+	节省索引空间
+
+- 缺点
+
+	1. 可能会增加额外的记录扫描次数
+	2. 无法使用覆盖索引
+
+比如email字段，现有值zhangsan@qq.com和zhangsan@163.com，如果使用前缀索引index(email(5))只取前5个字符串，那么查询语句```select * from t where email = "zhangsan@qq.com"```就不得不把zhangsan@163.com也遍历出来，因为前缀索引是zhang，两个值都包含，而zhangsan@163.com将会在server层被过滤掉
+
+无法使用覆盖索引也是同样道理，因为从索引中得到结果后，需要回表去进行过滤而不能直接返回数据，比如上述例子中的zhangsan@163.com。同样，就算前缀索引是index(email(100))，已经包含了整个字符串长度，也还是需要回表，因为系统并不确定前缀索引的定义是否截断了完整信息
+
+但是，假如说前缀索引是index(email(10))的话，那么zhangsan@163.com就不匹配了，所以合理的长度的前缀索引就可以做到既节省空间，又不用额外增加太多的查询成本。
+
+##### 建立合理的前缀索引
+主要看数据的区分度，区分度越高越合理，用如下语句就能确定区分度：
+
+	select 
+	  count(distinct left(email,4)）as L4,
+	  count(distinct left(email,5)）as L5,
+	  count(distinct left(email,6)）as L6,
+	  count(distinct left(email,7)）as L7,
+	from xxxx
+
+值越接近1，区分度越高
+
+##### 一些使用前缀索引的技巧
+以身份证号来举例子
+
+1. 倒序存储
+	
+	身份证号前6位是地址码，同一个地区的身份证号一般都相同，这是我们可以多建一列（或者在查询的使用，用reverse函数把身份证重新反转过来，这样就不需要新增一列了），倒过来存储身份证号并在这一列建前缀索引，这样区分度就高了
+
+2. 使用hash字段
+
+	把身份证号进行hash，新增一列用来存储这个hash结果（比如用crc32，hash出来的结果就一个int）并建立索引，这样就算不用前缀索引，也能节省空间，但是会存在hash冲突，所以每次查询的时候，都需要把身份证号带上作为查询条件，如：
+	```select * from t where id_card_hash = xxx and id_card = xxx```
+
+如果使用了以上两种方法的话，就不会支持范围查找了，只能只能支持等值查询。因为索引记录的，是反转或者hash结果的顺序，而不再是身份证号顺序了
+	
+
+
 
 ## 锁
 根据加锁的范围，MySQL 里面的锁大致可以分成全局锁、表级锁和行锁三类，其中全局锁、表级锁都是在server层实现的，而行级锁则是在存储引擎层实现的（myisam就没有行锁）
