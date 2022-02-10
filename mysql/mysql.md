@@ -188,14 +188,9 @@ innodb_io_capacity变量定义了InnoDB后台任务每秒可用的I/O操作数(I
 ```fio -filename=$filename -direct=1 -iodepth 1 -thread -rw=randrw -ioengine=psync -bs=16k -size=500M -numjobs=10 -runtime=10 -group_reporting -name=mytest 
 ```
 
-
-
 nnodb_io_capacity 定义了后台任务可用的 IOPS 量
 
 innodb_io_capacity_max 定义了后台任务可用的最大 IOPS 量
-
-
-
 
 
 ###### 二阶段提交
@@ -258,6 +253,74 @@ innodb_io_capacity_max 定义了后台任务可用的最大 IOPS 量
 innoDB存储引擎正在写入某个页到表中，突然发生了宕机（比如16KB的页，只写了4KB），通过重做日志中的记录进行恢复的时候（重新执行），因为页已经发生了损坏（写了4KB的数据），再重新对该页操作是没意义的
 
 所以引入了双写，在对缓冲池的脏页进行刷新时，先记录原先该页的数据，当写入失效发生的时候，先恢复该页原来的数据，在重新通过重做日志重新执行一次操作
+
+
+### 关于delete语句无法回收磁盘空间问题
+delete语句执行之后，只是在对应的页上标记为已删除状态，实际上空间时没有被回收的，如果有新的数据，就会复用这个空间，覆盖原来的数据，举个例子：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220210005517859-1456726384.png)
+
+如果删除的500这个数据，那么innodb就会在R4上标记已删除，但是并不会回收空间，如果下次再有新的值插入，而且值是在400 ~ 600之间（小于400会插入R3之前，大于600则会插入R5之后），才会复用这个空间，否则会一直占着，如果是PAGE A这个页被标记删除了的话，那么如果innodb申请新的内存页的话，可以直接复用这个页
+
+如果要回收被标记为已删除的空间的话，需要重建表，用以下语句即可：
+
+```alter table xxx engine=innodb```
+
+注意，在重建表的时候，InnoDB 不会把整张表占满，每个页留了 1/16 给后续的更新用。也就是说，其实重建表之后不是“最”紧凑的。有这么一种情况，本来表里面每个页都是满了的，但是因为执行了重建表的语句，却让每个表空出了1/16，所以这种特殊情况下，执行上述语句重建表的话反而会将表变得更大
+
+### count(*)的实现方式
+#### myisam
+myisam引擎会把一个表的总行数存在了磁盘上，因此执行 count(*) 的时候会直接返回这个数，效率很高（当没有where条件的情况下）
+
+#### innodb
+需要把数据一行一行地从引擎里面读出来，然后累积计数
+
+为啥innodb不像myisam那样，把count(*)存起来？
+
+由于mvcc的原因，同一时刻不同查询有可能看到的数据行数是不一样的，所以就算存起来了也没啥意义
+
+其实，执行命令```show table status like "%表名%"```中，有一列为Rows，也是表示表数据总数，但是这个值是根据采样估算得来的，官方文档也说误差可能达到40% ~ 50%
+
+#### count(*)的优化
+在mysql5.6的版本，使用count(*)是用聚簇索引的，但在mysql5.7中，MySQL优化器会找到最小的那棵索引树来遍历
+
+#### 不同count()的用法
+首先要先明白一个概念，count还一个聚合函数，对于返回的结果集，需要一行一行的进行判断，如果count函数的参数不是NULL，累计值就加 1，否则不加。最后返回累计值。所以，不是同一个表，不同的count用法，其结果是不一样的，如下图所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220210231131573-1392647946.jpg)
+
+在分析性能方面，有这么几个原则：
+1. server层要什么就给什么
+2. innodb只给必要的值
+
+对于count来说，现在的优化器只优化了count(*)的语义为“取行数”，其他显而易见的优化并没有
+
+下面，就来介绍4种count的方式 
+
+##### count(主键)
+innodb会遍历整张表，然后返回主键给server层，因为主键不可能为null，所以server层无需判断抓紧是否为null，直接按行累加
+
+##### count(1)
+innodb会遍历整张表，但是不取值。server层对于返回的每一行，放个1进去，判断不可能为null，直接按行累加
+
+##### count(字段)
+innodb会遍历该字段所在的索引，此时分两种情况
+- 该字段定义为not null
+
+	innodb一行行的读出这个字段，因为定义为not null，所以server层判断不可能为null，直接按行累加
+
+- 该字段定义允许为null
+
+	innodb一行行的读出这个字段，因为定义允许为null，所以server层通过判断改字段是否为null，不为null才+1
+
+##### count(*)
+count(*)是 mysql专门做了优化的，虽然会遍历整张表，但是并不取值，count(*)默认不为null，直接按行累加
+
+注意，count(主键)和count(字段)，因为涉及到返回字段值，而从innodb引擎返回字段值会涉及到解析数据行，以及拷贝字段值的操作
+
+虽然count(1) 和 count(主键)看着像一样，但是实际上count(1)效率要比count(主键)高
+
+所以，按照效率排的话，count(*) ≈ count(1) > count(主键) > count(字段)
 
 
 
@@ -747,6 +810,40 @@ online ddl其中有一步操作是把mdl写锁退化成读锁，为的就是在�
 注意一下，改表锁的ddl流程，数据导出来的存放位置叫作tmp_table。这是一个临时表，是在server层创建的，而online ddl拷贝出来的数据是放在“tmp_file”里的，这个临时文件是 InnoDB 在内部创建出来的。整个DDL过程都在InnoDB内部完成
 
 所以，如果现在有一个1TB的表需要做ddl操作，但是磁盘间就只有1.2TB，这种情况是不能执行ddl的，因为tmp_file也是要占用临时空间的
+
+##### 关于online和inplace
+online ddl对于 server 层来说，没有把数据挪动到临时表，是一个“原地”操作，这就是“inplace”名称的来源
+
+在我们使用```alter table xxx engine = innodb```语句的时候，其实有一个隐藏值ALGORITHM=INPLACE（版本不同，alter的操作的这个值也不同）
+
+如上述的两个流程中，如果是使用在server层创建临时表的方式，ALGORITHM=COPY
+
+```alter table t engine=innodb,ALGORITHM=copy```
+
+而如果是使用在innodb存储引擎中生成临时文件的方式的话，则是ALGORITHM=INPLACE
+
+```alter table t engine=innodb,ALGORITHM=inplace```
+
+具体mysql版本对应的alter操作是怎样的，可以参考官方文档
+
+[mysql5.6](https://dev.mysql.com/doc/refman/5.6/en/innodb-online-ddl-operations.html)
+
+[mysql5.7](https://dev.mysql.com/doc/refman/5.7/en/innodb-online-ddl-operations.html)
+
+[mysql8.0](https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html)
+
+当然，虽然看起来inplace和online是相同的，但是假如添加的是全文索引，虽然ALGORITHM=INPLACE，但是由于会阻塞dml，却不是online的
+
+所以这里总结一下两者的关系
+1. 如果ddl是online的，那么一定是inplace
+2. 如果ddl是inplace的，那么有可能不是online的（比如添加全文索引和空间索引，mysql官方文档上，Permits Concurrent DML为No的，都不是online）
+
+#####如何判断是否在server层没有新建临时表
+最直观的方法就是看在执行完alter语句后，rows affected 是否为0, 不为0就是server层新建了临时表,如下入所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220211011234973-1280427830.jpg)
+
+
 
 ### 行锁
 #### 两阶段锁协议
