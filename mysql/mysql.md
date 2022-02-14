@@ -209,18 +209,41 @@ innodb_io_capacity_max 定义了后台任务可用的最大 IOPS 量
 
 其中，如果在执行的过程中，服务器down掉了，那个分为3种情况进行分析：
 
-- 如果redo log处在prepare阶段，但还没写binlog，那么恢复之后就会执行数据的回滚操作
+- 如果redo log处在prepare阶段，但还没写完binlog，那么恢复之后就会执行数据的回滚操作
 
-- 如果redo log处在prepare阶段，已经写了binlog，那么恢复之后只要在binlog找到记录，就会把redo log改为commit状态
+- 如果redo log处在prepare阶段，已经写完了binlog，那么恢复之后只要在binlog找到记录，就会把redo log改为commit状态
 
 - 如果redo log处在commit状态， 那么说明binlog肯定有对应的数据，那么直接提交事务即可
 
 为什么要搞这么复杂，其实就是为了保证redo log和binlog数据的一致性。
 
 试想下，如果binlog和redo log数据不一致的话，那么数据一致性肯定会遭到破坏，比如：
-- binlog 多了一条update id = 2的操作，而redo log没有，那么从库的数据肯定和主库不一直，而且用binlog在恢复数据的时候，也会莫名其妙多了一条update id = 2
+
+- binlog 多了一条update id = 2的操作，而redo log没有，那么从库的数据肯定和主库不一致，而且用binlog在恢复数据的时候，也会莫名其妙多了一条update id = 2
 
 - 反之，redo log有而binlog没有，那么从库肯定会丢了这条数据，而恢复数据的时候，也会丢掉这条数据
+
+####### mysql如何知道binlog已经写完？
+mysql binlog一共有两种格式，分别是statement和row。 
+
+- 对于statement来说，最后有commit就是完整的。
+
+- 对于row来说，最后会有一个XID event，如：
+
+		### INSERT INTO `test`.`test3`
+		### SET
+		###   @1=3008 /* INT meta=0 nullable=0 is_null=0 */
+		###   @2='aaa' /* VARSTRING(120) meta=120 nullable=1 is_null=0 */
+		###   @3=3000 /* INT meta=0 nullable=0 is_null=0 */
+		# at 496
+		#220215  0:30:49 server id 1  end_log_pos 527 CRC32 0xab3331fe 	Xid = 903085
+
+####### redo log和binlog是怎么关联起来的?
+两者有个共同的字段Xid，崩溃恢复的时候，会顺序扫描redo log，如果redo log既有prepare又有commit，那么直接提交，如果redo log只有prepare，那么就用Xid去找binlog，如果找到的话就提交，找不到就回滚
+
+####### mysql为什么redo log只有perpare，且binlog完整的话，就可以直接提交？
+
+
 
 ###### 双1参数介绍
 双1参数指的是innodb_flush_log_at_trx_commit和sync_binlog，分别表示每次事务的redo log和binlog持久化到磁盘的策略
