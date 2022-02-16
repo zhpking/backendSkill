@@ -242,6 +242,36 @@ mysql binlog一共有两种格式，分别是statement和row。
 两者有个共同的字段Xid，崩溃恢复的时候，会顺序扫描redo log，如果redo log既有prepare又有commit，那么直接提交，如果redo log只有prepare，那么就用Xid去找binlog，如果找到的话就提交，找不到就回滚
 
 ####### mysql为什么redo log只有perpare，且binlog完整的话，就可以直接提交？
+主要是因为binlog涉及到从库的数据的一致性，如果binlog已经完整了，而redo log却不提交，那么就会导致主库少了这次的记录，从而导致主从数据不一致
+
+####### 只用binlog来实现事务，去掉redo log，可以吗？
+不行，因为事务提交后，并不是立即刷盘的，而仅仅只是把内存中对应的数据页修改了而已，如果此时发生了crash的话，那么内存中数据页的数据没有redo log进行恢复从而会导致数据丢失，如下图所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220217004923238-542275088.jpg)
+
+如果commit1的数据提交后，还没落盘的话，那么发生了crash后，commit1的数据因为无法恢复内存中数据页的数据，从而导致了数据的丢失
+
+####### 只用redo log而不用binlog来实现事务，可以吗？
+这个其实可以的，因为从崩溃恢复的角度来说，innodb存储引擎恢复数据，用的就是redo log，因为设计到主从复制的关系，所以才需要二阶段提交来保证主从数据一致性，既然关掉了binlog，也就是没有了从库，就只需要关心主库的数据恢复问题，而这主库数据页修复仅依靠redo log就完成可以做到
+
+但是，注意一点就是redo log无法替代binlog的功能，比如binlog能保存每一条sql语句执行的记录，而redo log无法做到，因为redo log是循环写的，在优先的空间内，后写的数据会覆盖前写的数据
+
+###### 正常运行中的实例，数据写入后的最终落盘，是从 redo log 更新过来的还是从 buffer pool 更新过来的呢？
+从buffer pool更新的，因为redo log并不是记录数据页的完整数据，而仅仅是记录数据的修改记录，比如说将A的值从1更新成2
+
+在正常情况下，buffer pool的数据页与磁盘中的数据页不一致的话，就会被称为脏页。最终数据落盘，就是把脏页的数据写入磁盘中，这个过程完全和redo log无关
+
+在数据库崩溃恢复的时候，innodb先是把磁盘中的数据加载到内存中，然后通过redo log的记录，把因崩溃而在内存中丢失的更新数据，给恢复过来。这个更新过程完成后，buffer pool中的数据页重新变成脏页，等待数据落盘
+
+####### redo log buffer 是什么？是先修改内存，还是先写 redo log 文件？
+redo log buffer 其实就是一块内存，在事务执行的过程中，先把执行的语句更新记录写入到redo log buffer，然后在commit的时候，再从redo log buffer 中，把更新记录写入redo log文件，举个例子：
+
+	begin;
+	insert into t1 ...
+	insert into t2 ...
+	commit;
+
+在执行commit之前，两条insert语句的数据页修改记录，会先写入redo log buffer中，最后执行到commit语句的时候，才把这两条insert语句的数据页修改记录写入的redo log文件（文件名是 ib_logfile+ 数字）中
 
 
 
