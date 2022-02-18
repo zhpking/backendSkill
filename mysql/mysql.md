@@ -358,6 +358,7 @@ innodb会遍历整张表，但是不取值。server层对于返回的每一行�
 
 ##### count(字段)
 innodb会遍历该字段所在的索引，此时分两种情况
+
 - 该字段定义为not null
 
 	innodb一行行的读出这个字段，因为定义为not null，所以server层判断不可能为null，直接按行累加
@@ -374,6 +375,39 @@ count(*)是 mysql专门做了优化的，虽然会遍历整张表，但是并不
 虽然count(1) 和 count(主键)看着像一样，但是实际上count(1)效率要比count(主键)高
 
 所以，按照效率排的话，count(*) ≈ count(1) > count(主键) > count(字段)
+
+
+#### order by的实现原理
+如果排序的字段，是在索引上的，那么返回的数据，就直接就是有序的数据了。但是，如果排序的字段，并不存在于索引上，innodb会把所有的数据返回给server层，然后server层排序后再返回结果集。
+
+举个例子：
+
+	CREATE TABLE `t` (
+	  `id` int(11) NOT NULL,
+	  `city` varchar(16) NOT NULL,
+	  `name` varchar(16) NOT NULL,
+	  `age` int(11) NOT NULL,
+	  `addr` varchar(128) DEFAULT NULL,
+	  PRIMARY KEY (`id`),
+	  KEY `city` (`city`)
+	) ENGINE=InnoDB;
+
+	select city,name,age from t where city='杭州' order by name limit 1000
+
+name因为没有索引， 所以会在server层的sort_buffer中进行排序，而实现排序的方式，一共有3种。
+
+##### 全字段排序
+1. server层初始化sort_buffer，根据sql语句，确定要把city，name，age这几个字段放进来
+2. 从二级索引city中查找city="杭州"的数据，然后根据id回表查询name，age字段数据，然后返回给server层存入sort_buffer中
+3. 重复第2步，一直遍历到city不满足="杭州"的条件为止，然后返回server层对sort_buffer中的数据进行排序
+4. 排序后，返回前1000条结果
+
+其流程图如下所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220219000051517-123915685.jpg)
+
+##### 外部排序
+##### rowid排序
 
 
 
