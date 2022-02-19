@@ -394,11 +394,25 @@ count(*)是 mysql专门做了优化的，虽然会遍历整张表，但是并不
 
 	select city,name,age from t where city='杭州' order by name limit 1000
 
+##### 索引上有排序字段
+我们先假设，现在表结构有一个 ```KEY city_name(`city`,`name`) ``` 索引，那么排序的执行流程如下：
+1. 从二级索引city_name中找到city="杭州"的数据，然后根据id回表查询name，age字段，作为结果集的一部分直接返回
+2. 重复第1步，一直遍历到city不满足="杭州"的条件为止或者查到第1000条记录，循环结束
+
+其流程如下图所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220220011048128-617312162.jpg)
+
+当然，如果索引是 ```KEY city_name_age(`city`,`name`,`age`) ``` 的话，那么就是覆盖索引了，就不需要回表了，这是流程如下图所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220220011721556-2117399866.jpg)
+
+##### 索引上无排序字段
 name因为没有索引， 所以会在server层的sort_buffer中进行排序，而实现排序的方式，一共有3种。
 
-##### 全字段排序
+###### 全字段排序
 1. server层初始化sort_buffer，根据sql语句，确定要把city，name，age这几个字段放进来
-2. 从二级索引city中查找city="杭州"的数据，然后根据id回表查询name，age字段数据，然后返回给server层存入sort_buffer中
+2. 从二级索引city中查找city="杭州"的数据，然后根据id回表查询name，age字段数据，返回给server层存入sort_buffer中
 3. 重复第2步，一直遍历到city不满足="杭州"的条件为止，然后返回server层对sort_buffer中的数据进行排序
 4. 排序后，返回前1000条结果
 
@@ -406,9 +420,29 @@ name因为没有索引， 所以会在server层的sort_buffer中进行排序，�
 
 ![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220219000051517-123915685.jpg)
 
-##### 外部排序
-##### rowid排序
+###### 外部排序
+当sort_buffer设置的大小（sort_buffer_size参数配置），不满足存放从表里读取的所有数据的时候，这时候就需要用到硬盘来作为临时存储从而进行排序，这就是外部排序
 
+外部排序，一般是用归并排序法，也就是把排序的数据分成多份(根据sort_buffer_size来分，sort_buffer_size越小分的份数越高)，每一份单独排序后存放到临时文件中，最后多个临时文件再合并成一个有序的大文件
+
+###### rowid排序
+由于外部排序需要用到临时文件，所以在性能方面这个排序方法不太友好，究其原因会出现用外部排序的方法进行排序，就是因为数据行太大导致了sort_buffer装不下，需要借助临时文件进行排序
+
+所以mysql有一个配置参数max_length_for_sort_data，当需要排序的数据行的大小大于该参数值时，就会只取出主键和排序字段放入sort_buffer，而不是整行字段，最后排序后根据主键再去获取所需字段，返回结果集
+
+比如说，因为现在需要的字段是city,name，age，而这3个字段加起来大小为36（16+16+4）就是需要排序的数据行大小，假设说当max_length_for_sort_data的配置大于36的话，就会使用rowid排序
+
+对于全字段排序，rowid排序流程如下：
+1. server层初始化sort_buffer，因为数据行大小大于max_length_for_sort_data，所以sort buffer确定只需要把id和name这两个字段放进来
+2. 从二级索引city中查找city="杭州"的数据，然后根据id回表查询name字段数据，返回给server层存入sort_buffer中
+3. 重复第2步，一直遍历到city不满足="杭州"的条件为止，然后返回server层对sort_buffer中的数据进行排序
+4. 排序后的数据，获取前1000条，然后根据id字段遍历去主键索引获取city，age和name字段，最后返回结果
+
+其流程图如下所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220220005528794-35283403.jpg)
+
+其中，结果集只是一个逻辑概念，实际上mysql服务端sort_buffer 中依次取出 id，然后到原表查到 city、name 和 age 这三个字段的结果，不需要在服务端再耗费内存存储结果，是直接返回给客户端的
 
 
 ## 事务隔离
