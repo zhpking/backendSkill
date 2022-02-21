@@ -383,7 +383,7 @@ count(*)是 mysql专门做了优化的，虽然会遍历整张表，但是并不
 举个例子：
 
 	CREATE TABLE `t` (
-	  `id` int(11) NOT NULL,
+	  `id` int(11) NOT NULL auto_increment,
 	  `city` varchar(16) NOT NULL,
 	  `name` varchar(16) NOT NULL,
 	  `age` int(11) NOT NULL,
@@ -408,6 +408,12 @@ count(*)是 mysql专门做了优化的，虽然会遍历整张表，但是并不
 ![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220220011721556-2117399866.jpg)
 
 ##### 索引上无排序字段
+我们可以先看下该语句explain解析出来的结果
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220222001741021-2032182235.png)
+
+extra中，有Using filesort，就是无索引的排序方式。
+
 name因为没有索引， 所以会在server层的sort_buffer中进行排序，而实现排序的方式，一共有3种。
 
 ###### 全字段排序
@@ -443,6 +449,47 @@ name因为没有索引， 所以会在server层的sort_buffer中进行排序，�
 ![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220220005528794-35283403.jpg)
 
 其中，结果集只是一个逻辑概念，实际上mysql服务端sort_buffer 中依次取出 id，然后到原表查到 city、name 和 age 这三个字段的结果，不需要在服务端再耗费内存存储结果，是直接返回给客户端的
+
+##### 索引上无排序字段，且排序字段不存在表中
+我们再来看一个例子
+	
+	CREATE TABLE `words` (
+  		`id` int(11) NOT NULL AUTO_INCREMENT,
+  		`word` varchar(64) DEFAULT NULL,
+  		PRIMARY KEY (`id`)
+	) ENGINE=InnoDB;
+
+	select word from words order by rand() limit 3;
+
+这sql语句的含义是随机获取3条数据，其explain解析结果如下所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220222001756986-1835465743.png)
+
+其中，extra中有Using temporary说明使用了临时表， Using filesort表示需要排序操作，所以这个extra的意思就是需要在临时表中进行排序操作
+
+因为sql语句只需要一个随机值和word，为了方便描述，随机值简写为R，word简写为W，其排序流程如下：
+
+1. 初始化内存临时表，内存临时表使用的是memory存储引擎，而内存临时表只有两个字段W和R
+
+2. 从主键中按顺序获取word字段值，每一个对应的word值生成一个0-1的随机数(rand()函数)，然后写入临时表的W和R中
+
+3. 初始化sort buffer，sort buffer中有两个字段，字段类型分别是int和double，其中int存放的是临时表的位置信息（相当于临时表的主键，因为就是用这个字段来回表），double则是放rand()函数生成的随机数，然后根据R的值进行排序
+
+4. 排序完成后，因为只需要前3条数据，所以取出前3个位置信息，回内存临时表获取W值，最后返回给客户端
+
+其流程图如下所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220222010824324-2135326575.png)
+
+注意：
+
+- 对于innodb表来说，因为执行全字段排序会减少磁盘访问，因此会被优先选择
+
+- 但是对于内存临时表，也就是memory表来说，因为整个表就已经存在于内存了，回表也是纯内存操作，并不涉及到磁盘访问，因此mysql会优先考虑排序的行越小越好，优先使用的是rowid排序
+
+
+
+
 
 
 ## 事务隔离
