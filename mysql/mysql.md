@@ -487,10 +487,362 @@ name因为没有索引， 所以会在server层的sort_buffer中进行排序，�
 
 - 但是对于内存临时表，也就是memory表来说，因为整个表就已经存在于内存了，回表也是纯内存操作，并不涉及到磁盘访问，因此mysql会优先考虑排序的行越小越好，优先使用的是rowid排序
 
+###### 优先队列排序算法
+在mysql5.6之后，为了优化外部排序，mysql引入了优先队列排序算法，在查询语句带有limit n的时候，只排序前n条数据
 
+还是以 ```select word from words order by rand() limit 3``` 举例
 
+假如总数据量为10000条，但是查询的时候排序后只需要返回3条（order by rand() limit 3），那么其实我们是并不需要对10000条数据进行排序的，只需要保证前3条数据是10000条数据中最小的3条就可以了
 
+而优先队列排序算法，就是先把前3条数据放入sort_buffer，当然，因为是order by rand(),这3条数据在sort_buffer中要先从小到大排序，构成一个最大堆，然后对剩下的9997条数据依次比较
 
+为了方便描述，这里把3条数据中，最大的数据设为R，需要对比的数据设为R'
+
+- 如果R <= R'，继续从临时表中取出下一条数据比较
+
+- 如果R > R'，那么把R剔除出最大堆中，然后把R'放入到最大堆中，重新排序
+
+剩余的9997条数据重复以上流程，对比完后最终在sort_buffer的3条数据，就是最小的3条数据，最后根据rowid从临时表中取出word字段，返回结果
+
+我们以6个数据为例，其流程如下图所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220224070816191-1499474812.png)
+
+##### 如何判断sql查询排序时是否用了临时文件
+可以通过查看OPTIMIZER_TRACE的结果来确认是否使用了临时文件
+
+	/*只对本线程有影响*/
+	set optimizer_trace='enabled=on';
+
+	select bid from hunter.cdb_hunter_group_member order by rand() limit 3;
+
+	SELECT * FROM `information_schema`.`OPTIMIZER_TRACE`;
+
+其结果如下所示
+
+	{
+	  "steps": [
+	    {
+	      "join_preparation": {
+	        "select#": 1,
+	        "steps": [
+	          {
+	            "expanded_query": "/* select#1 */ select `test`.`t`.`bid` AS `bid` from `test`.`t` order by rand() limit 3"
+	          }
+	        ]
+	      }
+	    },
+	    {
+	      "join_optimization": {
+	        "select#": 1,
+	        "steps": [
+	          {
+	            "table_dependencies": [
+	              {
+	                "table": "`test`.`t`",
+	                "row_may_be_null": false,
+	                "map_bit": 0,
+	                "depends_on_map_bits": [
+	                ]
+	              }
+	            ]
+	          },
+	          {
+	            "rows_estimation": [
+	              {
+	                "table": "`test`.`t`",
+	                "table_scan": {
+	                  "rows": 140928,
+	                  "cost": 1315
+	                }
+	              }
+	            ]
+	          },
+	          {
+	            "considered_execution_plans": [
+	              {
+	                "plan_prefix": [
+	                ],
+	                "table": "`test`.`t`",
+	                "best_access_path": {
+	                  "considered_access_paths": [
+	                    {
+	                      "access_type": "scan",
+	                      "rows": 140928,
+	                      "cost": 29501,
+	                      "chosen": true
+	                    }
+	                  ]
+	                },
+	                "cost_for_plan": 29501,
+	                "rows_for_plan": 140928,
+	                "chosen": true
+	              }
+	            ]
+	          },
+	          {
+	            "attaching_conditions_to_tables": {
+	              "original_condition": null,
+	              "attached_conditions_computation": [
+	              ],
+	              "attached_conditions_summary": [
+	                {
+	                  "table": "`test`.`t`",
+	                  "attached": null
+	                }
+	              ]
+	            }
+	          },
+	          {
+	            "clause_processing": {
+	              "clause": "ORDER BY",
+	              "original_clause": "rand()",
+	              "items": [
+	                {
+	                  "item": "rand()"
+	                }
+	              ],
+	              "resulting_clause_is_simple": false,
+	              "resulting_clause": "rand()"
+	            }
+	          },
+	          {
+	            "refine_plan": [
+	              {
+	                "table": "`test`.`t`",
+	                "access_type": "index_scan"
+	              }
+	            ]
+	          }
+	        ]
+	      }
+	    },
+	    {
+	      "join_execution": {
+	        "select#": 1,
+	        "steps": [
+	          {
+	            "creating_tmp_table": {
+	              "tmp_table_info": {
+	                "table": "intermediate_tmp_table",
+	                "row_length": 17,
+	                "key_length": 0,
+	                "unique_constraint": false,
+	                "location": "memory (heap)",
+	                "row_limit_estimate": 123361
+	              }
+	            }
+	          },
+	          {
+	            "converting_tmp_table_to_myisam": {
+	              "cause": "memory_table_size_exceeded",
+	              "tmp_table_info": {
+	                "table": "intermediate_tmp_table",
+	                "row_length": 17,
+	                "key_length": 0,
+	                "unique_constraint": false,
+	                "location": "disk (MyISAM)",
+	                "record_format": "fixed"
+	              }
+	            }
+	          },
+	          {
+	            "filesort_information": [
+	              {
+	                "direction": "asc",
+	                "table": "intermediate_tmp_table",
+	                "field": "tmp_table_column"
+	              }
+	            ],
+	            "filesort_priority_queue_optimization": {
+	              "limit": 3,
+	              "rows_estimate": 203614,
+	              "row_size": 24,
+	              "memory_available": 868352,
+	              "chosen": true
+	            },
+	            "filesort_execution": [
+	            ],
+	            "filesort_summary": {
+	              "rows": 4,
+	              "examined_rows": 203604,
+	              "number_of_tmp_files": 0,
+	              "sort_buffer_size": 128,
+	              "sort_mode": "<sort_key, additional_fields>"
+	            }
+	          }
+	        ]
+	      }
+	    }
+	  ]
+	}{
+	  "steps": [
+	    {
+	      "join_preparation": {
+	        "select#": 1,
+	        "steps": [
+	          {
+	            "expanded_query": "/* select#1 */ select `test`.`t`.`bid` AS `bid` from `test`.`t` order by rand() limit 3"
+	          }
+	        ]
+	      }
+	    },
+	    {
+	      "join_optimization": {
+	        "select#": 1,
+	        "steps": [
+	          {
+	            "table_dependencies": [
+	              {
+	                "table": "`test`.`t`",
+	                "row_may_be_null": false,
+	                "map_bit": 0,
+	                "depends_on_map_bits": [
+	                ]
+	              }
+	            ]
+	          },
+	          {
+	            "rows_estimation": [
+	              {
+	                "table": "`test`.`t`",
+	                "table_scan": {
+	                  "rows": 140928,
+	                  "cost": 1315
+	                }
+	              }
+	            ]
+	          },
+	          {
+	            "considered_execution_plans": [
+	              {
+	                "plan_prefix": [
+	                ],
+	                "table": "`test`.`t`",
+	                "best_access_path": {
+	                  "considered_access_paths": [
+	                    {
+	                      "access_type": "scan",
+	                      "rows": 140928,
+	                      "cost": 29501,
+	                      "chosen": true
+	                    }
+	                  ]
+	                },
+	                "cost_for_plan": 29501,
+	                "rows_for_plan": 140928,
+	                "chosen": true
+	              }
+	            ]
+	          },
+	          {
+	            "attaching_conditions_to_tables": {
+	              "original_condition": null,
+	              "attached_conditions_computation": [
+	              ],
+	              "attached_conditions_summary": [
+	                {
+	                  "table": "`test`.`t`",
+	                  "attached": null
+	                }
+	              ]
+	            }
+	          },
+	          {
+	            "clause_processing": {
+	              "clause": "ORDER BY",
+	              "original_clause": "rand()",
+	              "items": [
+	                {
+	                  "item": "rand()"
+	                }
+	              ],
+	              "resulting_clause_is_simple": false,
+	              "resulting_clause": "rand()"
+	            }
+	          },
+	          {
+	            "refine_plan": [
+	              {
+	                "table": "`test`.`t`",
+	                "access_type": "index_scan"
+	              }
+	            ]
+	          }
+	        ]
+	      }
+	    },
+	    {
+	      "join_execution": {
+	        "select#": 1,
+	        "steps": [
+	          {
+	            "creating_tmp_table": {
+	              "tmp_table_info": {
+	                "table": "intermediate_tmp_table",
+	                "row_length": 17,
+	                "key_length": 0,
+	                "unique_constraint": false,
+	                "location": "memory (heap)",
+	                "row_limit_estimate": 123361
+	              }
+	            }
+	          },
+	          {
+	            "converting_tmp_table_to_myisam": {
+	              "cause": "memory_table_size_exceeded",
+	              "tmp_table_info": {
+	                "table": "intermediate_tmp_table",
+	                "row_length": 17,
+	                "key_length": 0,
+	                "unique_constraint": false,
+	                "location": "disk (MyISAM)",
+	                "record_format": "fixed"
+	              }
+	            }
+	          },
+	          {
+	            "filesort_information": [
+	              {
+	                "direction": "asc",
+	                "table": "intermediate_tmp_table",
+	                "field": "tmp_table_column"
+	              }
+	            ],
+	            "filesort_priority_queue_optimization": {
+	              "limit": 3,
+	              "rows_estimate": 203614,
+	              "row_size": 24,
+	              "memory_available": 868352,
+	              "chosen": true
+	            },
+	            "filesort_execution": [
+	            ],
+	            "filesort_summary": {
+	              "rows": 4,
+	              "examined_rows": 203604,
+	              "number_of_tmp_files": 0,
+	              "sort_buffer_size": 128,
+	              "sort_mode": "<sort_key, additional_fields>"
+	            }
+	          }
+	        ]
+	      }
+	    }
+	  ]
+	}
+
+filesort_summary中的number_of_tmp_files表示的就是排序临时文件数，如果number_of_tmp_files为0的话就表示没有使用临时文件
+
+filesort_summary.examined_rows 表示查询记录数
+
+filesort_summary.sort_mode:
+
+- <sort_key, additional_fields> 使用紧凑排序，如用排序字段的定义是varchar(30)，但是在排序过程中还是要按照实际长度来分配空间的
+
+- <sort_key, additional_fields> 使用rowid排序方式进行排序
+
+filesort_priority_queue_optimization.chosen:true 表示使用了优先队列排序算法
 
 ## 事务隔离
 ### 事务的四个特性
