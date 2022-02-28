@@ -844,6 +844,28 @@ filesort_summary.sort_mode:
 
 filesort_priority_queue_optimization.chosen:true 表示使用了优先队列排序算法
 
+#### 当varchar类型查询字段，条件比设置的字符数大的执行流程
+
+	CREATE TABLE `table_a` (
+  		`id` int(11) NOT NULL,
+  		`b` varchar(10) DEFAULT NULL,
+  		PRIMARY KEY (`id`),
+  		KEY `b` (`b`)
+	) ENGINE=InnoDB;
+
+	select * from table_a where b='1234567890abcd';
+
+假设现在表里面，有 100 万行数据，其中有 10 万行数据的 b 的值是’1234567890’，那么其执行流程如下：
+
+1. 因为varchar定义的字符长度为10，所以1234567890abcd只截取前10个字符（1234567890），然后进行匹配
+
+2. 因为满足条件的数据有10w条，所以需要回表10w次
+
+3. 每次回表的时候，都会在server层判断，b是否等于1234567890abcd，因为都不等，所以返回的结果为空
+
+因此，mysql不会因为定义的是varchar(10)，就直接返回类似```Impossible WHERE noticed after reading const tables```的结果
+
+
 ## 事务隔离
 ### 事务的四个特性
 分别是原子性（Atomicity）、一致性（Consistency）、隔离性（Isolation）、持久性（Durability），即ACID
@@ -1228,9 +1250,95 @@ T表有个索引abc，而最左前缀的意思就是先比较a的大小，再比
 	```select * from t where id_card_hash = xxx and id_card = xxx```
 
 如果使用了以上两种方法的话，就不会支持范围查找了，只能只能支持等值查询。因为索引记录的，是反转或者hash结果的顺序，而不再是身份证号顺序了
+
+### explain
+
+### 索引失效的情况
+以下面的表结构举例
+
+	CREATE TABLE `tradelog` (
+  		`id` int(11) NOT NULL,
+		`bid` int(10) NOT NULL,
+  		`tradeid` varchar(32) DEFAULT NULL,
+  		`operator` int(11) DEFAULT NULL,
+  		`t_modified` datetime DEFAULT NULL,
+  		PRIMARY KEY (`id`),
+		KEY `bid` (`bid`)
+  		KEY `tradeid` (`tradeid`),
+  		KEY `t_modified` (`t_modified`)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+1. 条件字段使用函数或直接运算（注意是条件字段，也就是where子句 “=”号左边才是条件字段）
+
+	如：
+
+	```select * from tradelog where month(t_modified) = 10 ```
+
+	```select * from tradelog where bid +1 = 1645803143```
+
+2. 隐式类型转换
+
+	如：
+
+	```select * from tradelog where tradeid = 10```
+
+	因为tradeid是varchar类型，而10是int类型，在字符串和整型比较的过程中，字符串会先转化为整型，然后再进行比较，所以上述语句其实相当于
+
+	```mysql> select * from tradelog where  CAST(tradid AS signed int) = 110717```
+
+	如何判断数据类型转换的规则？
 	
+	遇到这种情况的时候，可以自己找个例子，去数据库中做实验就好了，比如 select "10" > 9
 
+	- 如果返回1，则说明是10 > 9，那么就是字符串转整型
+	
+	- 如果返回0，则说明是"10" > "9"，那么就是整型转字符串
 
+3. 隐式字符编码转换
+
+	如：
+
+		CREATE TABLE `trade_detail` (
+	  		`id` int(11) NOT NULL,
+	 		`tradeid` varchar(32) DEFAULT NULL,
+	  		`trade_step` int(11) DEFAULT NULL, /* 操作步骤 */
+	  		`step_info` varchar(32) DEFAULT NULL, /* 步骤信息 */
+	  		PRIMARY KEY (`id`),
+	  		KEY `tradeid` (`tradeid`)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8
+
+		insert into tradelog values(1, 'aaaaaaaa', 1000, now());
+		insert into tradelog values(2, 'aaaaaaab', 1000, now());
+		insert into tradelog values(3, 'aaaaaaac', 1000, now());
+		 
+		insert into trade_detail values(1, 'aaaaaaaa', 1, 'add');
+		insert into trade_detail values(2, 'aaaaaaaa', 2, 'update');
+		insert into trade_detail values(3, 'aaaaaaaa', 3, 'commit');
+		insert into trade_detail values(4, 'aaaaaaab', 1, 'add');
+		insert into trade_detail values(5, 'aaaaaaab', 2, 'update');
+		insert into trade_detail values(6, 'aaaaaaab', 3, 'update again');
+		insert into trade_detail values(7, 'aaaaaaab', 4, 'commit');
+		insert into trade_detail values(8, 'aaaaaaac', 1, 'add');
+		insert into trade_detail values(9, 'aaaaaaac', 2, 'update');
+		insert into trade_detail values(10, 'aaaaaaac', 3, 'update again');
+		insert into trade_detail values(11, 'aaaaaaac', 4, 'commit');
+		
+		select d.* from tradelog l, trade_detail d where d.tradeid=l.tradeid and l.id=2;
+
+	因为tradelog表字符集是utf8mb4,trade_detail表的字符集是utf8，所以当对trade_detail表进行搜索的时候，就会变成
+
+	``` select * from trade_detail  where CONVERT(traideid USING utf8mb4)="aaaaaaab" /* aaaaaaab是id为2的tradeid的值 */ ```
+
+	因为对条件字段进行函数操作，所以导致trade_detail表的索引失效
+
+	utf8mb4是utf8的超集。类似地，在程序设计语言里面，做自动类型转换的时候，为了避免数据在转换过程中由于截断导致数据错误，也都是“按数据长度增加的方向”进行转换的。
+
+	所以，只要我们把语句改写成
+
+	```select d.* from tradelog l , trade_detail d where d.tradeid=CONVERT(l.tradeid USING utf8) and l.id=2```
+
+	trade_detail就可以走索引了
 
 ## 锁
 根据加锁的范围，MySQL 里面的锁大致可以分成全局锁、表级锁和行锁三类，其中全局锁、表级锁都是在server层实现的，而行级锁则是在存储引擎层实现的（myisam就没有行锁）
@@ -1395,3 +1503,42 @@ online ddl对于 server 层来说，没有把数据挪动到临时表，是一�
     D在等C
 
 	现在来了一个E，发现E需要等D，那么E就判断跟D、C是否会形成死锁，这个检测不用管B和A
+
+### 查找哪个线程持有锁
+创建如下表：
+
+	CREATE TABLE `t` (
+  		`id` int(11) NOT NULL AUTO_INCREMENT,
+  		`city` varchar(16) NOT NULL,
+  		`name` varchar(16) NOT NULL,
+  		`age` int(11) NOT NULL,
+  		`addr` varchar(128) DEFAULT NULL,
+  		PRIMARY KEY (`id`),
+  		KEY `city` (`city`)
+	) ENGINE=InnoDB
+
+sessionA：执行 ``` lock table t write /*持有mdl写锁*/ ```
+
+sessionB：执行 ``` select * from t where id = 1 /*此时会被阻塞*/ ```
+
+sessionC：执行 ``` show full processlist ``` 查看线程情况，如下所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220226080953209-834760603.jpg)
+
+因为只有3个线程，所以我们可以很快就知道：
+
+sessionA的线程id是2422
+
+sessionB的线程id是2423，在等待mdl锁
+
+sessionC的线程id是2424
+
+但是，在生产环境中，面对show full processlist输出的大量数据，我们可以这样快速定位到：
+
+``` select * from sys.schema_table_lock_waits ```
+
+![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220226081815513-1587596291.jpg)
+
+- blocking_pid：持有锁的线程id
+
+- sql_kill_blocking_connecttion：kill掉持有锁的执行线程
