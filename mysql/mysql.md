@@ -1763,3 +1763,43 @@ sessionB的加锁范围是也是(5,10)和c=10和(10,15)
 此时sessionA再执行insert语句，因为sessionB持有(5,10)间隙锁，因此insert语句又会进入锁等待被阻塞从而导致了死锁
 
 这个例子很好的说明了，申请next-key lock的时候，并不是一起申请，而是间隙锁和行锁分开申请
+
+
+
+## 一些经验总结
+
+如果我们想要kill掉某个会话，那么我们怎么知道这个会话是否在执行事务呢
+
+以一下表来举例
+
+	CREATE TABLE `test` (
+  		`id` int(11) NOT NULL,
+  		`c` int(11) DEFAULT NULL,
+  		`d` int(11) DEFAULT NULL,
+  		PRIMARY KEY (`id`),
+  		KEY `c` (`c`)
+	) ENGINE=InnoDB
+
+现在分别开启两个会话sessionA和sessionB
+
+sessionA：
+
+```insert into test values(50,50,50)```
+
+sessionB:
+
+什么也不执行
+
+新开一个会话C，执行 ```show full processlist``` 输出如下图所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202203/901559-20220316002531353-1563415279.jpg)
+
+会话50和51中，肯定是有一个在执行事务的，但是command都是sleep，info也没输出sql，到底怎么知道insert语句在哪个会话执行
+
+这时候可以查询 ```information_schema.innodb_trx```，这个表记录着的是正在执行的事务
+
+执行 ```select * from information_schema.innodb_trx where trx_mysql_thread_id in(50, 51)\G``` 输出结果如下所示：
+
+![](https://img2022.cnblogs.com/blog/901559/202203/901559-20220316002544685-1141318811.jpg)
+
+正在执行事务的是会话50,51是没有执行任何东西的，所以需要kill掉会话的话可以先kill掉会话51
