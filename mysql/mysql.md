@@ -111,6 +111,7 @@ change buffer 是用来优化二级且非唯一索引，且对应的数据页没
 不会，因为语句写入change buffer后，接下来的流程（图中第9,10步）会写入bin log和redo log，而且事务提交，bin log和redo log写成功后，事务才会执行成功，所以就算change buffer丢了，在恢复数据的时候，redo log也是已经是更新完的数据。
 
 ###### 触发merge操作时机
+
 - 访问对应的数据页
 
 - 后台线程定期merge
@@ -118,13 +119,16 @@ change buffer 是用来优化二级且非唯一索引，且对应的数据页没
 - 数据库正常关闭（shutdown）
 
 ###### change buffer大小设置
+
 innodb_change_buffer_max_size参数，设置为50就是change buffer的大小最多只能占用buffer pool的50%
 
 
 ##### redo log和binlog
+
 redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb特有的，用来实现crash-safe，而binlog是server层特有的日志，所以无论哪个存储引擎都能够使用。
 
 ###### redo log
+
 如果数据每次在每次更新或者插入的时候，都直接写磁盘持久化的话，那么这样会带来io的性能损耗，为了优化这点，innodb使用了一种WAL技术（Write-Ahead Logging），也就是在数据落盘之前，innodb会先写日志，再写磁盘。
 
 具体来说，就是更新和插入的数据，innodb只要把buffer pool的数据更新了，写完了redo log，就认为数据的更新已经完成了（当然还要写bin log，但是这是server层做的事）。同时，innodb一般会在系统比较空闲的时候，再把redo log的操作记录批量更新到磁盘里，这样做的好处就是减少了io，把随机写改成了顺序写。
@@ -132,17 +136,45 @@ redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb
 除此之外，redo log还能保证数据库发生异常重启，之前提交的记录都不会丢失，因为只要写到redo log后，发生了异常重启只要把重新把磁盘中redo log的数据重新加载回内存即可（crash-safe）。
 
 当然，redo log的内存不是无限大的，而是固定大小（参数innodb_log_file_size【每个redo log文件大小】 innodb_mirrored_log_groups【有多少个redo log文件，但5.7该参数就被废弃了】），而且是个环状结构，其结构如下图所示：
+
 ![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220202230337968-1594751133.png)
 
 - write pos：当前记录写到的位置
+ 
 - check point：开始回收内存的位置
 
 所以write pos和check point就是redo log内存所剩空间，如果write pos追上了check point，那么innodb就无法继续执行数据更新，只能先把redo log中的数据持久化落盘，回收内存，推进check point位置空出剩余内存后，才能继续执行更新操作。
 
+###### redo log的写入机制
+
+
+
 ###### binlog
+
 用于记录mysql执行插入和更新操作的相关语句，用于数据备份和主从复制。
 
+###### binlog的写入机制
+
+先写binlog cache，事务提交的时候在写入binlog文件中
+
+binlog cache是每个线程都拥有一个，大小由```binlog_cache_size```决定，如果查过binlog_cache_size，那么就要暂存到磁盘
+
+其写入流程如下图所示
+
+![](https://img2022.cnblogs.com/blog/901559/202203/901559-20220323000003791-1967457915.png)
+
+binlog cache(mysql线程的内存) -> page cache(操作系统里文件系统的页缓存) -> disk（磁盘）
+
+- wirte
+
+	指的是从binlog cache写入page cache，存内存操作
+
+- fsync
+
+	指的是从page cache写入磁盘，真正的磁盘操作（产生IOPS）
+
 ###### redo log和binlog的不同点
+
 - redo log 是 InnoDB 引擎特有的；binlog 是 MySQL 的 Server 层实现的，所有引擎都可以使用。
 
 - redo log 是物理日志，记录的是“在某个数据页上做了什么修改”；binlog 是逻辑日志，记录的是这个语句的原始逻辑，比如“给 ID=2 这一行的 c 字段加 1 ”。
@@ -150,12 +182,15 @@ redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb
 - redo log 是循环写的，空间固定会用完；binlog 是可以追加写入的。“追加写”是指 binlog 文件写到一定大小后会切换到下一个，并不会覆盖以前的日志。
 
 ##### flush操作
+
 就是把脏页数据，落盘到磁盘上
 
 ###### 脏页
+
 内存数据页跟磁盘数据页内容不一致，这个内存页就叫脏页
 
 ###### 触发flush操作的时机
+
 - redo log写满
 
 - 系统内存不足，需要淘汰一些内存页，而这些内存页恰巧包含了脏页
@@ -181,6 +216,7 @@ redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb
 而1,2种情况，都是有脏页导致的（第一种情况是脏页越多，redo log占用就越大），所以，只要降低了脏页的比例，那么就能尽可能的避免上面这两种情况了
 
 ###### 刷脏页的控制策略
+
 innodb_io_capacity变量定义了InnoDB后台任务每秒可用的I/O操作数(IOPS)，这个参数控制了innodb每秒刷脏页的速率，所以一般这个值设置成磁盘的IOPS
 
 磁盘的 IOPS 可以通过 fio 这个工具来测试，下面的语句是我用来测试磁盘随机读写的命令：
@@ -194,6 +230,7 @@ innodb_io_capacity_max 定义了后台任务可用的最大 IOPS 量
 
 
 ###### 二阶段提交
+
 9~13的执行过程，其实就是二阶段提交，其过程细化后，如下图所示：
 ![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220202233717482-1824718105.png)
 
@@ -224,6 +261,7 @@ innodb_io_capacity_max 定义了后台任务可用的最大 IOPS 量
 - 反之，redo log有而binlog没有，那么从库肯定会丢了这条数据，而恢复数据的时候，也会丢掉这条数据
 
 ####### mysql如何知道binlog已经写完？
+
 mysql binlog一共有两种格式，分别是statement和row。 
 
 - 对于statement来说，最后有commit就是完整的。
@@ -239,12 +277,15 @@ mysql binlog一共有两种格式，分别是statement和row。
 		#220215  0:30:49 server id 1  end_log_pos 527 CRC32 0xab3331fe 	Xid = 903085
 
 ####### redo log和binlog是怎么关联起来的?
+
 两者有个共同的字段Xid，崩溃恢复的时候，会顺序扫描redo log，如果redo log既有prepare又有commit，那么直接提交，如果redo log只有prepare，那么就用Xid去找binlog，如果找到的话就提交，找不到就回滚
 
 ####### mysql为什么redo log只有perpare，且binlog完整的话，就可以直接提交？
+
 主要是因为binlog涉及到从库的数据的一致性，如果binlog已经完整了，而redo log却不提交，那么就会导致主库少了这次的记录，从而导致主从数据不一致
 
 ####### 只用binlog来实现事务，去掉redo log，可以吗？
+
 不行，因为事务提交后，并不是立即刷盘的，而仅仅只是把内存中对应的数据页修改了而已，如果此时发生了crash的话，那么内存中数据页的数据没有redo log进行恢复从而会导致数据丢失，如下图所示：
 
 ![](https://img2022.cnblogs.com/blog/901559/202202/901559-20220217004923238-542275088.jpg)
@@ -252,11 +293,13 @@ mysql binlog一共有两种格式，分别是statement和row。
 如果commit1的数据提交后，还没落盘的话，那么发生了crash后，commit1的数据因为无法恢复内存中数据页的数据，从而导致了数据的丢失
 
 ####### 只用redo log而不用binlog来实现事务，可以吗？
+
 这个其实可以的，因为从崩溃恢复的角度来说，innodb存储引擎恢复数据，用的就是redo log，因为设计到主从复制的关系，所以才需要二阶段提交来保证主从数据一致性，既然关掉了binlog，也就是没有了从库，就只需要关心主库的数据恢复问题，而这主库数据页修复仅依靠redo log就完成可以做到
 
 但是，注意一点就是redo log无法替代binlog的功能，比如binlog能保存每一条sql语句执行的记录，而redo log无法做到，因为redo log是循环写的，在优先的空间内，后写的数据会覆盖前写的数据
 
 ###### 正常运行中的实例，数据写入后的最终落盘，是从 redo log 更新过来的还是从 buffer pool 更新过来的呢？
+
 从buffer pool更新的，因为redo log并不是记录数据页的完整数据，而仅仅是记录数据的修改记录，比如说将A的值从1更新成2
 
 在正常情况下，buffer pool的数据页与磁盘中的数据页不一致的话，就会被称为脏页。最终数据落盘，就是把脏页的数据写入磁盘中，这个过程完全和redo log无关
@@ -264,6 +307,7 @@ mysql binlog一共有两种格式，分别是statement和row。
 在数据库崩溃恢复的时候，innodb先是把磁盘中的数据加载到内存中，然后通过redo log的记录，把因崩溃而在内存中丢失的更新数据，给恢复过来。这个更新过程完成后，buffer pool中的数据页重新变成脏页，等待数据落盘
 
 ####### redo log buffer 是什么？是先修改内存，还是先写 redo log 文件？
+
 redo log buffer 其实就是一块内存，在事务执行的过程中，先把执行的语句更新记录写入到redo log buffer，然后在commit的时候，再从redo log buffer 中，把更新记录写入redo log文件，举个例子：
 
 	begin;
@@ -276,6 +320,7 @@ redo log buffer 其实就是一块内存，在事务执行的过程中，先把�
 
 
 ###### 双1参数介绍
+
 双1参数指的是innodb_flush_log_at_trx_commit和sync_binlog，分别表示每次事务的redo log和binlog持久化到磁盘的策略
 
 - innodb_flush_log_at_trx_commit
@@ -292,7 +337,7 @@ redo log buffer 其实就是一块内存，在事务执行的过程中，先把�
 - sync_binlog
 
 	- 0
-		每次提交事务都只write，不fsync
+		每次提交事务都只write，不fsync，由系统自身决定啥时候fsync
 	
 	- 1
 		每次提交事务都会执行fsync
@@ -301,6 +346,7 @@ redo log buffer 其实就是一块内存，在事务执行的过程中，先把�
 		每次提交事务都write，但累积N个事务后才fsync
 
 ##### double write
+
 提供可靠性（就是从page cache中持久化到磁盘过程提供可靠性，因为mysql页是16k，而操作系统磁盘写入最小单位是4k，所以刷盘的时候只能4k4k地写）
 
 innoDB存储引擎正在写入某个页到表中，突然发生了宕机（比如16KB的页，只写了4KB），通过重做日志中的记录进行恢复的时候（重新执行），因为页已经发生了损坏（写了4KB的数据），再重新对该页操作是没意义的
