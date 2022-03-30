@@ -147,6 +147,39 @@ redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb
 
 ###### redo log的写入机制
 
+先写redo log buffer，事务提交的时候再持久化到磁盘中，其写入流程如下图所示
+
+![](https://img2022.cnblogs.com/blog/901559/202203/901559-20220328232945783-697511674.png)
+
+redo log buffer(mysql程序的内存，所有线程共享一个) -> page cache(操作系统里文件系统的页缓存) -> disk(磁盘)
+
+
+redo log的写入机制，主要是由 ```innodb_flush_log_at_trx_commit``` 参数控制
+
+- 0
+	每次事务提交时都只是把redo log留在redo log buffer中
+	
+- 1
+	每次事务提交时都将redo log直接持久化到磁盘
+	
+- 2
+	每次事务提交时都只是把redo log写到page cache（innodb有一个后台线程，会每秒调用write把redo log buffer写到page cache，再调用fsync持久化到磁盘）
+
+innodb 有一个后台线程，每隔1s就会把redo log buffer中的日志，调用write写入到page cache，然后fsync到磁盘
+
+注意，redo log在事务提交的时候，其实是分为两个步骤的，先prepare再commit，所以 ```innodb_flush_log_at_trx_commit = 1```的时候，其实指的是redo log在prepare阶段的时候，需要持久化一次，而commit阶段，其实就只是写到page cache里
+
+因为服务器崩溃恢复的时候，只要有prepare阶段的redo log和bin log，就足够恢复数据了，因此redo log在commit阶段就不需要fsync，只需要写入page cache，然后等待每秒一次后台轮询刷盘fsync就可以了
+
+除了后台线程每秒1次轮询刷盘外，还有另外两种情况会把redo log持久化到磁盘
+
+1. redo log buffer 占用的空间即将达到 innodb_log_buffer_size 一半的时候，后台线程会主动写盘
+
+	由于这个事务并没有提交，所以这个写盘动作只是 write，而没有调用 fsync，也就是只留在了文件系统的 page cache
+
+2. 并行的事务提交的时候，顺带将这个事务的 redo log buffer 持久化到磁盘
+
+	假设一个事务 A 执行到一半，已经写了一些 redo log 到 buffer 中，这时候有另外一个线程的事务 B 提交，如果 innodb_flush_log_at_trx_commit 设置的是 1，那么按照这个参数的逻辑，事务 B 要把 redo log buffer 里的日志全部持久化到磁盘。这时候，就会带上事务 A 在 redo log buffer 里的日志一起持久化到磁盘
 
 
 ###### binlog
@@ -157,7 +190,7 @@ redo log和bin log 是mysql两个十分重要的日志，其中redo log是innodb
 
 先写binlog cache，事务提交的时候在写入binlog文件中
 
-binlog cache是每个线程都拥有一个，大小由```binlog_cache_size```决定，如果查过binlog_cache_size，那么就要暂存到磁盘
+binlog cache是每个线程都拥有一个(跟redo log buffer不一样，redo log buffer是全局的)，大小由```binlog_cache_size```决定，如果查过binlog_cache_size，那么就要暂存到磁盘
 
 其写入流程如下图所示
 
@@ -173,6 +206,17 @@ binlog cache(mysql线程的内存) -> page cache(操作系统里文件系统的�
 
 	指的是从page cache写入磁盘，真正的磁盘操作（产生IOPS）
 
+binlog 的写入机制，如要是由 ```sync_binlog``` 参数（mysql双1参数之一）控制
+
+- 0
+	每次提交事务都只write，不fsync，由系统自身决定啥时候fsync
+	
+- 1
+	每次提交事务都会执行fsync
+	
+- N（N>1）
+	每次提交事务都write，但累积N个事务后才fsync
+
 ###### redo log和binlog的不同点
 
 - redo log 是 InnoDB 引擎特有的；binlog 是 MySQL 的 Server 层实现的，所有引擎都可以使用。
@@ -180,6 +224,73 @@ binlog cache(mysql线程的内存) -> page cache(操作系统里文件系统的�
 - redo log 是物理日志，记录的是“在某个数据页上做了什么修改”；binlog 是逻辑日志，记录的是这个语句的原始逻辑，比如“给 ID=2 这一行的 c 字段加 1 ”。
 
 - redo log 是循环写的，空间固定会用完；binlog 是可以追加写入的。“追加写”是指 binlog 文件写到一定大小后会切换到下一个，并不会覆盖以前的日志。
+
+###### 组提交（group commit）
+
+1. LSN
+	
+	LSN（log sequence number）指的是日志逻辑序列号，它是单调递增的，用来对应着每次redo log的写入点，每次写入的redo log长度假设为length，那么LSN = LSN + length
+	
+	LSN也会写入到InnoDB的数据页中，其作用是确保数据页不会被多次执行重复的redo log
+
+2. 组提交流程
+
+	而所谓的组提交，就是多个事务并发执行，某个事务提交的时候，会把其他事务已经写入到redo log buffer的内容一起持久化到磁盘，其流程如下图所示：
+	
+	![](https://img2022.cnblogs.com/blog/901559/202203/901559-20220329233948330-866544733.png)
+	
+	有3个事务，分别是trx1，trx2和trx3，他们对应的LSN（假设LSN从0开始）依次是50,120,160
+	
+	1. trx1先到达，就会成为这组的leader
+	
+	2. trx1开始写盘的时候（提交的prepare阶段），这组里面已经有3个事务了，这时LSN变为了160
+	
+	3. trx1写盘，带的就是LSN=160，等trx1写盘成功返回后，所有LSN<=160的redo log，都已经被持久化到磁盘了
+	
+	4. trx2和trx3需要写盘的时候，因为LSN<=160，已经持久化完毕了，所以不需要任何操作直接返回
+
+	当然，因为开启了bin log的情况下，不止redo log需要写日志，binlog也要写日志，所以binlog也是有组提交的
+
+	在事务的提交流程中，其中有一步是先写redo log，再写binlog，然后提交事务，现在结合组提交再来细化一下这个流程，其流程如下图所示：
+
+	![](https://img2022.cnblogs.com/blog/901559/202203/901559-20220330002348693-325954750.png)
+
+	1. redo log prepare write
+
+		redo log日志(prepare阶段)从redo log buffer -> page cache
+
+	2. binlog write
+
+		binlog日志从binlog cache -> page cache
+
+	3. redo log prepare fsync
+
+		redo log日志(prepare阶段)从page cache -> 磁盘
+
+	4. binlog fsync
+
+		binlog日志从page cache -> 磁盘
+
+	5. redo log commit write
+
+		redo log日志(commit阶段)，从redo log buffer -> page cache，等待后台线程每秒持久化到磁盘
+
+	为了能更好的使redo log和binlog利用组提交的效果，mysql尽可能的拖延redo log和binlog持久化到硬盘的时机，比如在redo log持久化之前，先执行binlog的write操作，在binlog落盘之前，先执行redo log的fsync操作
+
+	mysql更是提供了两个参数，用来优化binlog的组提交
+
+	- binlog_group_commit_sync_delay
+
+		表示延迟多少微秒后才调用 fsync
+
+	- binlog_group_commit_sync_no_delay_count
+
+		表示累积多少次以后才调用 fsync
+
+	以上两个参数只要满足其中之一，就会调用fsync把binlog持久化到磁盘
+
+	最后，补充一点，上图中1-5的步骤，每个步骤其实都有一个队列，每个队列都有一把锁保护，第一个进入队列的事务会成为leader，leader领导所在队列的所有事务，全权负责整队的操作，完成后通知队内其他事务操作结束。
+
 
 ##### flush操作
 
@@ -260,7 +371,7 @@ innodb_io_capacity_max 定义了后台任务可用的最大 IOPS 量
 
 - 反之，redo log有而binlog没有，那么从库肯定会丢了这条数据，而恢复数据的时候，也会丢掉这条数据
 
-####### mysql如何知道binlog已经写完？
+###### mysql如何知道binlog已经写完？
 
 mysql binlog一共有两种格式，分别是statement和row。 
 
@@ -276,15 +387,15 @@ mysql binlog一共有两种格式，分别是statement和row。
 		# at 496
 		#220215  0:30:49 server id 1  end_log_pos 527 CRC32 0xab3331fe 	Xid = 903085
 
-####### redo log和binlog是怎么关联起来的?
+###### redo log和binlog是怎么关联起来的?
 
 两者有个共同的字段Xid，崩溃恢复的时候，会顺序扫描redo log，如果redo log既有prepare又有commit，那么直接提交，如果redo log只有prepare，那么就用Xid去找binlog，如果找到的话就提交，找不到就回滚
 
-####### mysql为什么redo log只有perpare，且binlog完整的话，就可以直接提交？
+###### mysql为什么redo log只有perpare，且binlog完整的话，就可以直接提交？
 
 主要是因为binlog涉及到从库的数据的一致性，如果binlog已经完整了，而redo log却不提交，那么就会导致主库少了这次的记录，从而导致主从数据不一致
 
-####### 只用binlog来实现事务，去掉redo log，可以吗？
+###### 只用binlog来实现事务，去掉redo log，可以吗？
 
 不行，因为事务提交后，并不是立即刷盘的，而仅仅只是把内存中对应的数据页修改了而已，如果此时发生了crash的话，那么内存中数据页的数据没有redo log进行恢复从而会导致数据丢失，如下图所示：
 
@@ -292,7 +403,7 @@ mysql binlog一共有两种格式，分别是statement和row。
 
 如果commit1的数据提交后，还没落盘的话，那么发生了crash后，commit1的数据因为无法恢复内存中数据页的数据，从而导致了数据的丢失
 
-####### 只用redo log而不用binlog来实现事务，可以吗？
+###### 只用redo log而不用binlog来实现事务，可以吗？
 
 这个其实可以的，因为从崩溃恢复的角度来说，innodb存储引擎恢复数据，用的就是redo log，因为设计到主从复制的关系，所以才需要二阶段提交来保证主从数据一致性，既然关掉了binlog，也就是没有了从库，就只需要关心主库的数据恢复问题，而这主库数据页修复仅依靠redo log就完成可以做到
 
@@ -306,7 +417,7 @@ mysql binlog一共有两种格式，分别是statement和row。
 
 在数据库崩溃恢复的时候，innodb先是把磁盘中的数据加载到内存中，然后通过redo log的记录，把因崩溃而在内存中丢失的更新数据，给恢复过来。这个更新过程完成后，buffer pool中的数据页重新变成脏页，等待数据落盘
 
-####### redo log buffer 是什么？是先修改内存，还是先写 redo log 文件？
+###### redo log buffer 是什么？是先修改内存，还是先写 redo log 文件？
 
 redo log buffer 其实就是一块内存，在事务执行的过程中，先把执行的语句更新记录写入到redo log buffer，然后在commit的时候，再从redo log buffer 中，把更新记录写入redo log文件，举个例子：
 
@@ -321,29 +432,7 @@ redo log buffer 其实就是一块内存，在事务执行的过程中，先把�
 
 ###### 双1参数介绍
 
-双1参数指的是innodb_flush_log_at_trx_commit和sync_binlog，分别表示每次事务的redo log和binlog持久化到磁盘的策略
-
-- innodb_flush_log_at_trx_commit
-
-	- 0
-		每次事务提交时都只是把redo log留在redo log buffer中
-	
-	- 1
-		每次事务提交时都将redo log直接持久化到磁盘
-	
-	- 2
-		每次事务提交时都只是把redo log写到page cache（innodb有一个后台线程，会每秒调用write把redo log buffer写到page cache，再调用fsync持久化到磁盘）
-
-- sync_binlog
-
-	- 0
-		每次提交事务都只write，不fsync，由系统自身决定啥时候fsync
-	
-	- 1
-		每次提交事务都会执行fsync
-	
-	- N（N>1）
-		每次提交事务都write，但累积N个事务后才fsync
+双1参数指的是 ```innodb_flush_log_at_trx_commit``` 和 ```sync_binlog``` ，分别表示每次事务的redo log和binlog持久化到磁盘的策略（详情可以看redo log的写入机制和binlog的写入机制）
 
 ##### double write
 
@@ -1810,7 +1899,43 @@ sessionB的加锁范围是也是(5,10)和c=10和(10,15)
 
 这个例子很好的说明了，申请next-key lock的时候，并不是一起申请，而是间隙锁和行锁分开申请
 
+## 主从
 
+### binlog的格式
+
+为了便于描述，下面的讲解将用以下表和数据作为例子
+
+	Create Table: CREATE TABLE `t11` (
+  		`id` int(10) NOT NULL AUTO_INCREMENT,
+  		`a` int(10) NOT NULL DEFAULT '0',
+  		`b` int(10) NOT NULL DEFAULT '0',
+  		PRIMARY KEY (`id`),
+  		KEY `idx_a` (`a`),
+  		KEY `idx_b` (`b`)
+	) ENGINE=InnoDB
+
+	insert into t11 values(null,1,100);
+	insert into t11 values(null,2,99);
+	insert into t11 values(null,3,98);
+	insert into t11 values(null,4,97);
+	insert into t11 values(null,5,96);
+	insert into t11 values(null,6,95);
+
+通过 ```show master status``` 可以获取当前的binlong文件名
+
+#### statement
+
+先执行
+
+```delete from t11 where a>=4 and b<=97 limit 1;```
+
+然后在执行
+
+```show binlog events in mysql-bin.001013```
+
+结果如下图所示
+
+![](https://img2022.cnblogs.com/blog/901559/202203/901559-20220331002444348-1975916999.jpg)
 
 ## 一些经验总结
 
